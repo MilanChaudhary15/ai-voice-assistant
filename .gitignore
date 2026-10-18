@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+
+# Downloaded models
+models/
+*.onnx
+*.bin
+
+# Generated recordings
+recordings/
+*.wav
+
+# Local configuration
+.streamlit/secrets.toml

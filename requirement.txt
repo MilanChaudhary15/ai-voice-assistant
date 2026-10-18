@@ -1,0 +1,7 @@
+streamlit
+faster-whisper
+requests
+soundfile
+sounddevice
+scipy
+piper-tts
