@@ -68,8 +68,8 @@ Before running the application, install or configure:
 ### 1. Clone the repository
 
 ```bash
-git clone <YOUR_GITHUB_REPOSITORY_URL>
-cd <YOUR_REPOSITORY_FOLDER>
+git clone <https://github.com/MilanChaudhary15/ai-voice-assistant>
+cd <ai-voice-assistant>
 ```
 
 Replace the placeholders with your actual GitHub repository URL and folder name.
