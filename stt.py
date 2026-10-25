@@ -7,9 +7,11 @@ MODEL_SIZE = "base"
 print("Loading Faster-Whisper model...")
 
 model = WhisperModel(
-    MODEL_SIZE,
+    "base",
     device="cpu",
     compute_type="int8",
+    cpu_threads=2,
+    num_workers=1,
 )
 
 print("Faster-Whisper model loaded successfully!")

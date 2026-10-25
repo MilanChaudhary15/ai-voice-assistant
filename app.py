@@ -1,16 +1,21 @@
-
-import base64
 from pathlib import Path
+from queue import Queue, Empty
+import threading
+import time
 
+import av
+import numpy as np
+import soundfile as sf
 import streamlit as st
-import streamlit.components.v1 as components
+from streamlit_webrtc import (
+    AudioProcessorBase,
+    WebRtcMode,
+    webrtc_streamer,
+)
 
 from stt import transcribe_audio
-from assistant import get_response
-from tts import speak_text
-
-
-# -------------------- PAGE CONFIG --------------------
+from assistant import get_response, SYSTEM_MESSAGE
+from tts import generate_speech, play_audio_file
 
 st.set_page_config(
     page_title="Local AI Voice Assistant",
@@ -21,410 +26,403 @@ st.set_page_config(
 
 RECORDINGS_DIR = Path("recordings")
 RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
-
 INPUT_AUDIO = RECORDINGS_DIR / "browser_recording.wav"
+LIVE_INPUT_AUDIO = RECORDINGS_DIR / "live_recording.wav"
 OUTPUT_AUDIO = RECORDINGS_DIR / "assistant_response.wav"
-
-
-# -------------------- CUSTOM STYLING --------------------
 
 st.markdown(
     """
     <style>
-    .block-container {
-        max-width: 900px;
-        padding-top: 2rem;
-        padding-bottom: 3rem;
-    }
-
+    .block-container { max-width: 900px; padding-top: 2rem; padding-bottom: 3rem; }
     .hero {
-        padding: 28px 22px;
-        border-radius: 20px;
-        text-align: center;
-        background: linear-gradient(
-            135deg, #102a43, #243b53
-        );
-        color: white;
-        margin-bottom: 22px;
+        padding: 26px 20px; border-radius: 18px; text-align: center;
+        background: linear-gradient(135deg, #102a43, #243b53);
+        color: white; margin-bottom: 20px;
     }
-
-    .hero h1 {
-        font-size: 2.2rem;
-        margin-bottom: 8px;
-        color: white;
-    }
-
-    .hero p {
-        font-size: 1.05rem;
-        margin-bottom: 0;
-        color: #e6eef7;
-    }
-
-    .section-card {
-        padding: 20px;
-        border: 1px solid rgba(128,128,128,0.3);
-        border-radius: 16px;
-        margin: 12px 0;
-    }
-
-    .step-label {
-        font-size: 1.1rem;
-        font-weight: 700;
-        margin-bottom: 8px;
-    }
-
-    div.stButton > button {
-        min-height: 54px;
-        border-radius: 12px;
-        font-size: 1.05rem;
-        font-weight: 650;
-        width: 100%;
-    }
-
-    /* Make the microphone recording area more prominent */
-    [data-testid="stAudioInput"] {
-        padding: 28px;
-        border: 3px solid #1769aa;
-        border-radius: 20px;
-        margin: 20px 0;
-        min-height: 110px;
-        background-color: rgba(23, 105, 170, 0.08);
-    }
-    
-    /* Increase the recorder's text size */
-    [data-testid="stAudioInput"] label {
-        font-size: 1.25rem !important;
-        font-weight: 700 !important;
-    }
-    
-    /* Make the recording area easier to notice */
-    [data-testid="stAudioInput"] button {
-        min-width: 64px;
-        min-height: 64px;
-        border-radius: 50%;
-    }
-
-    [data-testid="stChatMessage"] {
-        border-radius: 14px;
-    }
-
-    .hint {
-        font-size: 0.95rem;
-        opacity: 0.8;
-    }
+    .hero h1 { color: white; margin-bottom: 8px; }
+    .hero p { color: #e6eef7; margin-bottom: 0; }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
-
-# -------------------- SESSION STATE --------------------
-
 if "messages" not in st.session_state:
     st.session_state.messages = []
-
+if "llm_history" not in st.session_state:
+    st.session_state.llm_history = [SYSTEM_MESSAGE.copy()]
 if "last_transcript" not in st.session_state:
     st.session_state.last_transcript = ""
-
 if "last_response" not in st.session_state:
     st.session_state.last_response = ""
-
-
-# -------------------- HEADER --------------------
+if "live_status" not in st.session_state:
+    st.session_state.live_status = "Start the microphone to begin."
+if "live_audio_chunks" not in st.session_state:
+    st.session_state.live_audio_chunks = []
+if "live_silence_samples" not in st.session_state:
+    st.session_state.live_silence_samples = 0
+if "live_speech_started" not in st.session_state:
+    st.session_state.live_speech_started = False
+if "live_last_audio" not in st.session_state:
+    st.session_state.live_last_audio = b""
+if "live_turn_id" not in st.session_state:
+    st.session_state.live_turn_id = 0
+if "live_stop_event" not in st.session_state:
+    st.session_state.live_stop_event = threading.Event()
+if "live_playback_thread" not in st.session_state:
+    st.session_state.live_playback_thread = None
+if "live_is_speaking" not in st.session_state:
+    st.session_state.live_is_speaking = False
 
 st.markdown(
     """
     <div class="hero">
-        <h1>🎙️ Your AI Voice Assistant</h1>
-        <p>Speak naturally. Get intelligent answers.
-        Listen to the response.</p>
+      <h1>🎙️ Your AI Voice Assistant</h1>
+      <p>Speak naturally. Get an answer from your local AI and listen to it.</p>
     </div>
     """,
     unsafe_allow_html=True,
 )
+st.caption("Local pipeline: Faster-Whisper • Ollama Qwen 2.5 3B • Piper TTS")
 
-st.caption(
-    "Runs locally with Faster-Whisper, Qwen 2.5 3B and Piper TTS."
+mode = st.radio(
+    "Choose your interaction mode",
+    ["Record & Send", "Live Conversation"],
+    horizontal=True,
+    key="interaction_mode",
 )
 
+def add_turn(user_text: str, response: str):
+    st.session_state.last_transcript = user_text
+    st.session_state.last_response = response
+    st.session_state.messages.append({"role": "user", "content": user_text})
+    st.session_state.messages.append({"role": "assistant", "content": response})
 
-# -------------------- RECORDING --------------------
 
-st.markdown("## 🎤 Ask your question")
+def handle_audio_file(audio_bytes: bytes, input_path: Path, play_locally: bool = False):
+    input_path.write_bytes(audio_bytes)
+    with st.spinner("🎧 Transcribing speech..."):
+        user_text = transcribe_audio(str(input_path))
+    if not user_text.strip():
+        st.warning("No speech detected. Please try again and speak clearly.")
+        return
+    with st.spinner("🧠 Generating the answer with Ollama..."):
+        response = get_response(user_text, st.session_state.llm_history)
+    st.session_state.last_transcript = user_text
+    st.session_state.last_response = response
+    st.session_state.messages.extend([
+        {"role": "user", "content": user_text},
+        {"role": "assistant", "content": response},
+    ])
+    with st.spinner("🔊 Generating speech with Piper..."):
+        generated_path = generate_speech(response, OUTPUT_AUDIO)
+    st.success("Answer ready.")
+    st.markdown("**You said:**")
+    st.info(user_text)
+    st.markdown("**Assistant:**")
+    st.write(response)
+    st.audio(generated_path.read_bytes(), format="audio/wav")
 
-st.markdown(
-    """
-    <div class="section-card">
-        <div class="step-label">Step 1 — Record your voice</div>
-        <p>Click the microphone control below, allow microphone
-        access if asked, and speak your question clearly.</p>
-        <p class="hint">When you finish, use the recorder's
-        stop/done control. Then click Process my question.</p>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
 
-audio_file = st.audio_input(
-    "🎙️ Click here to record your question",
-    sample_rate=16000,
-)
+if mode == "Record & Send":
+    st.markdown("### 🎤 Record your question")
+    st.write("Record one question, stop the recording, then press Process.")
+    audio_file = st.audio_input("🎙️ Click to record your question", sample_rate=16000)
+    if st.button("✨ Process my question", type="primary", use_container_width=True):
+        if audio_file is None:
+            st.warning("Please record a question first.")
+        else:
+            try:
+                handle_audio_file(audio_file.getvalue(), INPUT_AUDIO)
+            except Exception as error:
+                st.error(f"Something went wrong: {error}")
+                st.info("Check that Ollama is running and the Whisper/Piper models are available.")
+    
+else:
+    st.markdown("### 🟢 Live Conversation")
+    st.write(
+        "Speak naturally. You can interrupt the assistant by speaking "
+        "while it is answering, or use Stop speaking."
+    )
 
-process_clicked = st.button(
-    "✨ Process my question",
-    type="primary",
-    use_container_width=True,
-)
+    st.info(
+        "Interruption detection uses microphone audio levels. "
+        "Headphones are recommended to reduce the assistant's voice "
+        "being mistaken for your speech."
+    )
 
-if process_clicked:
-    if audio_file is None:
-        st.warning(
-            "Please record a question using the microphone above first."
-        )
-    else:
-        INPUT_AUDIO.write_bytes(audio_file.getvalue())
-
-        try:
-            with st.spinner("🎧 Step 2 of 3: Understanding your speech..."):
-                user_text = transcribe_audio(str(INPUT_AUDIO))
-
-            if not user_text:
-                st.warning(
-                    "We couldn't detect any speech. Please try again "
-                    "and speak a little more clearly."
-                )
-            else:
-                st.session_state.last_transcript = user_text
-
-                with st.spinner("🧠 Step 3 of 3: Generating your answer..."):
-                    response = get_response(user_text)
-
-                st.session_state.last_response = response
-                st.session_state.messages.append(
-                    {"role": "user", "content": user_text}
-                )
-                st.session_state.messages.append(
-                    {"role": "assistant", "content": response}
-                )
-
-                # Generate the response audio.
-                # The TTS function also plays audio on the server computer.
-                with st.spinner("🔊 Preparing spoken response..."):
-                    speak_text(response)
-
-                st.success("Your answer is ready!")
-
-        except Exception as error:
-            st.error(f"Something went wrong: {error}")
-            st.info(
-                "Check that Ollama is running and the Whisper and "
-                "Piper models are available."
+    class AudioQueueProcessor(AudioProcessorBase):
+        def __init__(self):
+            self.frames = Queue(maxsize=250)
+            self.resampler = av.AudioResampler(
+                format="s16", layout="mono", rate=16000
             )
 
+        def recv(self, frame: av.AudioFrame) -> av.AudioFrame:
+            try:
+                converted = self.resampler.resample(frame)
+                for converted_frame in converted:
+                    samples = converted_frame.to_ndarray().reshape(-1).copy()
+                    try:
+                        self.frames.put_nowait(samples)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            return frame
 
-# -------------------- LATEST TRANSCRIPT --------------------
-
-if st.session_state.last_transcript:
-    st.markdown("---")
-    st.markdown("### 📝 What you said")
-    st.info(st.session_state.last_transcript)
-
-
-# -------------------- LATEST RESPONSE --------------------
-
-if st.session_state.last_response:
-    st.markdown("## 🔊 Listen to the answer")
-
-    st.markdown(
-        """
-        <div class="section-card">
-            <div class="step-label">Your spoken response</div>
-            <p>Use the large Play/Pause button below to listen.
-            You can pause and resume at any time.</p>
-        </div>
-        """,
-        unsafe_allow_html=True,
+    ctx = webrtc_streamer(
+        key="live-conversation-audio",
+        mode=WebRtcMode.SENDONLY,
+        audio_processor_factory=AudioQueueProcessor,
+        media_stream_constraints={"video": False, "audio": True},
+        async_processing=True,
     )
 
-    if OUTPUT_AUDIO.exists():
-        audio_bytes = OUTPUT_AUDIO.read_bytes()
-        audio_base64 = base64.b64encode(audio_bytes).decode("utf-8")
-
-        # A custom, larger playback control.
-        audio_player_html = """
-        <!DOCTYPE html>
-        <html>
-        <head>
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-        <style>
-            body {
-                font-family: Arial, sans-serif;
-                margin: 0;
-                padding: 10px 0;
-            }
-            .player {
-                border: 1px solid #8a9bad;
-                border-radius: 16px;
-                padding: 18px;
-                display: flex;
-                align-items: center;
-                gap: 16px;
-            }
-            .play {
-                width: 76px;
-                height: 64px;
-                flex-shrink: 0;
-                border: none;
-                border-radius: 14px;
-                background: #1769aa;
-                color: white;
-                font-size: 21px;
-                font-weight: bold;
-                cursor: pointer;
-            }
-            .play:focus {
-                outline: 3px solid #f0b429;
-                outline-offset: 3px;
-            }
-            .details {
-                flex: 1;
-                min-width: 0;
-            }
-            .label {
-                font-size: 17px;
-                font-weight: bold;
-                margin-bottom: 9px;
-            }
-            input[type=range] {
-                width: 100%;
-                min-height: 30px;
-                cursor: pointer;
-            }
-            .time {
-                font-size: 14px;
-                opacity: 0.8;
-                display: flex;
-                justify-content: space-between;
-            }
-        </style>
-        </head>
-        <body>
-        <div class="player">
-            <button class="play" id="toggle"
-                aria-label="Play response">▶ Play</button>
-            <div class="details">
-                <div class="label">Assistant voice response</div>
-                <input id="seek" type="range" min="0" max="100"
-                    value="0" step="0.1"
-                    aria-label="Audio position">
-                <div class="time">
-                    <span id="current">0:00</span>
-                    <span id="duration">0:00</span>
-                </div>
-            </div>
-        </div>
-        <audio id="audio" preload="metadata"
-            src="data:audio/wav;base64,__AUDIO_DATA__"></audio>
-        <script>
-            const audio = document.getElementById("audio");
-            const toggle = document.getElementById("toggle");
-            const seek = document.getElementById("seek");
-            const current = document.getElementById("current");
-            const duration = document.getElementById("duration");
-
-            function fmt(seconds) {
-                if (!Number.isFinite(seconds)) return "0:00";
-                const m = Math.floor(seconds / 60);
-                const s = Math.floor(seconds % 60);
-                return m + ":" + String(s).padStart(2, "0");
-            }
-
-            toggle.addEventListener("click", () => {
-                if (audio.paused) {
-                    audio.play().catch(() => {
-                        toggle.textContent = "▶ Retry";
-                    });
-                } else {
-                    audio.pause();
-                }
-            });
-
-            audio.addEventListener("play", () => {
-                toggle.textContent = "Ⅱ Pause";
-                toggle.setAttribute("aria-label", "Pause response");
-            });
-
-            audio.addEventListener("pause", () => {
-                toggle.textContent = "▶ Play";
-                toggle.setAttribute("aria-label", "Play response");
-            });
-
-            audio.addEventListener("loadedmetadata", () => {
-                duration.textContent = fmt(audio.duration);
-            });
-
-            audio.addEventListener("timeupdate", () => {
-                current.textContent = fmt(audio.currentTime);
-                if (audio.duration) {
-                    seek.value = (audio.currentTime / audio.duration) * 100;
-                }
-            });
-
-            seek.addEventListener("input", () => {
-                if (audio.duration) {
-                    audio.currentTime = (Number(seek.value) / 100)
-                        * audio.duration;
-                }
-            });
-
-            audio.addEventListener("ended", () => {
-                toggle.textContent = "▶ Replay";
-                toggle.setAttribute("aria-label", "Replay response");
-                seek.value = 0;
-            });
-        </script>
-        </body>
-        </html>
-        """
-
-        components.html(
-            audio_player_html.replace("__AUDIO_DATA__", audio_base64),
-            height=125,
-            scrolling=False,
-        )
-
-    st.markdown("### 💬 Answer text")
-    st.write(st.session_state.last_response)
-
-
-# -------------------- CONVERSATION HISTORY --------------------
-
-st.markdown("---")
-st.markdown("## 💬 Conversation history")
-
-if not st.session_state.messages:
     st.caption(
-        "Your conversation will appear here after your first question."
+        "Microphone status: "
+        + ("active" if ctx.state.playing else "stopped")
     )
-else:
-    for message in st.session_state.messages:
-        with st.chat_message(message["role"]):
-            if message["role"] == "user":
-                st.markdown("**You asked:**")
+
+    if ctx.state.playing and ctx.audio_processor:
+        if st.session_state.live_status == "Click START to enable the microphone.":
+            st.session_state.live_status = "Listening… speak when ready."
+
+        @st.fragment(run_every=0.2)
+        def live_turn_worker():
+            # All UI containers are created and used inside this fragment.
+            status_box = st.empty()
+            transcript_box = st.empty()
+            answer_box = st.empty()
+            audio_box = st.empty()
+
+            status_box.info(st.session_state.live_status)
+            # Manual interruption control
+            if st.button("⏹️ Stop speaking", key="stop_live_speaking"):
+                st.session_state.live_stop_event.set()
+                st.session_state.live_status = "Playback stopped."
+                st.session_state.live_is_speaking = False
+            
+            # Display the complete conversation in a scrollable panel
+            with st.container(height=420, border=True):
+                if not st.session_state.messages:
+                    st.caption("Your conversation will appear here.")
+
+                for message in st.session_state.messages:
+                    if message["role"] == "user":
+                        st.markdown("**You:**")
+                        st.write(message["content"])
+
+                    elif message["role"] == "assistant":
+                        st.markdown("**Assistant:**")
+                        st.write(message["content"])
+
+
+            saved_audio = st.session_state.get("live_audio_bytes", b"")
+            if saved_audio:
+                audio_box.audio(
+                    saved_audio, format="audio/wav", autoplay=False
+                )
+
+            processor = ctx.audio_processor
+            if not ctx.state.playing or processor is None:
+                st.session_state.live_status = "Microphone stopped."
+                status_box.warning(st.session_state.live_status)
+                return
+
+            samples_per_second = 16000
+            silence_limit = int(0.8 * samples_per_second)
+            min_speech_samples = int(0.35 * samples_per_second)
+            max_turn_samples = int(15 * samples_per_second)
+            threshold = 420
+
+            
+            received = []
+
+            try:
+                while True:
+                    received.append(processor.frames.get_nowait())
+            except Empty:
+                pass
+            
+            # DEBUG: Check incoming microphone audio
+            if received:
+                latest = received[-1].astype(np.float32)
+                rms = float(np.sqrt(np.mean(latest ** 2)))
+
+                status_box.info(
+                    f"DEBUG: Receiving audio | "
+                    f"Frames: {len(received)} | RMS: {rms:.1f}"
+                )
             else:
-                st.markdown("**Assistant:**")
-            st.write(message["content"])
-
-    if st.button("🗑️ Clear visible conversation", use_container_width=True):
-        st.session_state.messages = []
-        st.session_state.last_transcript = ""
-        st.session_state.last_response = ""
-        st.rerun()
+                status_box.warning(
+                    "DEBUG: No audio frames received from microphone."
+                )
 
 
-# -------------------- FOOTER --------------------
+            completed_turn = None
+
+            # completed_turn = None
+
+            for samples in received:
+                if len(samples) == 0:
+                    continue
+
+                rms = float(
+                    np.sqrt(
+                        np.mean(samples.astype(np.float32) ** 2)
+                    )
+                )
+                speechy = rms >= threshold
+
+                if speechy:
+                    st.session_state.live_speech_started = True
+                    st.session_state.live_silence_samples = 0
+                    st.session_state.live_audio_chunks.append(samples)
+
+                elif st.session_state.live_speech_started:
+                    st.session_state.live_audio_chunks.append(samples)
+                    st.session_state.live_silence_samples += len(samples)
+
+                total_samples = sum(
+                    len(chunk)
+                    for chunk in st.session_state.live_audio_chunks
+                )
+
+                if st.session_state.live_speech_started and (
+                    st.session_state.live_silence_samples >= silence_limit
+                    or total_samples >= max_turn_samples
+                ):
+                    if total_samples >= min_speech_samples:
+                        completed_turn = np.concatenate(
+                            st.session_state.live_audio_chunks
+                        )
+
+                    st.session_state.live_audio_chunks = []
+                    st.session_state.live_silence_samples = 0
+                    st.session_state.live_speech_started = False
+
+                    if completed_turn is not None:
+                        break
+
+            if completed_turn is None:
+                if st.session_state.live_speech_started:
+                    st.session_state.live_status = (
+                        "Speech detected… finish your sentence."
+                    )
+                    status_box.info(st.session_state.live_status)
+                return
+
+            st.session_state.live_status = "Processing your turn…"
+            status_box.info(st.session_state.live_status)
+
+            try:
+                sf.write(
+                    str(LIVE_INPUT_AUDIO),
+                    completed_turn,
+                    samples_per_second,
+                    subtype="PCM_16",
+                )
+
+                user_text = transcribe_audio(
+                    str(LIVE_INPUT_AUDIO)
+                ).strip()
+
+                if not user_text:
+                    st.session_state.live_status = (
+                        "No speech recognized. Please try again."
+                    )
+                    status_box.warning(
+                        st.session_state.live_status
+                    )
+                    return
+
+                st.session_state.last_transcript = user_text
+                transcript_box.markdown(
+                    "**You said:** " + user_text
+                )
+
+                response = get_response(
+                    user_text,
+                    st.session_state.llm_history,
+                )
+
+                st.session_state.messages.extend([
+                    {"role": "user", "content": user_text},
+                    {"role": "assistant", "content": response},
+                ])
+
+                st.session_state.last_response = response
+                answer_box.markdown(
+                    "**Assistant:** " + response
+                )
+
+                # Generate the assistant's spoken answer.
+                generated_path = generate_speech(
+                    response,
+                    OUTPUT_AUDIO,
+                )
+
+                audio_bytes = generated_path.read_bytes()
+                st.session_state.live_audio_bytes = audio_bytes
+
+                # Discard stale microphone frames captured while
+                # the previous question was being processed.
+                try:
+                    while True:
+                        processor.frames.get_nowait()
+                except Empty:
+                    pass
+
+                # Prepare an interruptible background playback.
+                stop_event = st.session_state.live_stop_event
+                stop_event.clear()
+
+                playback_thread = threading.Thread(
+                    target=play_audio_file,
+                    args=(generated_path, stop_event),
+                    daemon=True,
+                )
+
+                st.session_state.live_playback_thread = (
+                    playback_thread
+                )
+                st.session_state.live_is_speaking = True
+
+                # Keep the audio recording available for replay.
+                audio_box.audio(
+                    audio_bytes,
+                    format="audio/wav",
+                    autoplay=False,
+                )
+
+                # Start playback without blocking microphone processing.
+                playback_thread.start()
+
+                st.session_state.live_status = (
+                    "Speaking… interrupt me anytime by asking "
+                    "another question."
+                )
+                status_box.success(
+                    st.session_state.live_status
+                )
+
+            except Exception as error:
+                st.session_state.live_status = (
+                    f"Turn failed: {error}"
+                )
+                status_box.error(
+                    st.session_state.live_status
+                )
+        
+        live_turn_worker()
+
+    else:
+        st.session_state.live_status = (
+            "Click START to enable the microphone."
+        )
+        st.info(st.session_state.live_status)
+
 
 st.markdown("---")
-st.caption(
-    "🔒 Local AI pipeline • Faster-Whisper STT • Qwen 2.5 3B • Piper TTS"
-)
+st.caption("Local AI pipeline • Faster-Whisper STT • Qwen 2.5 3B • Piper TTS")
+
